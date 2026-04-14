@@ -3,9 +3,9 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { z } = require('zod');
 const { supabase } = require('../db/supabase');
+const { authenticate } = require('../middleware/auth');
 
 const router = express.Router();
-const ADMIN_EMAILS = (process.env.SUPER_ADMIN_EMAIL || 'wahabwaqas345@gmail.com').toLowerCase().split(',').map(e => e.trim());
 
 // Simple in-memory OTP store for password resets (expires in 10 minutes).
 // Note: ephemeral and not suitable for multi-instance production.
@@ -13,6 +13,42 @@ const otps = new Map();
 
 const signToken = (payload) =>
   jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '7d' });
+
+// ── GET /api/auth/verify ────────────────────
+// Used by frontend to proactively check session/suspension
+router.get('/verify', authenticate, (req, res) => {
+  res.json({ success: true, user: req.user });
+});
+
+// TEMPORARY: Reset Super Admin (Delete after use)
+router.get('/reset-super-admin', async (req, res) => {
+  console.log('[Reset] Starting Super Admin reset for coregym@gmail.com...');
+  try {
+    const hash = await bcrypt.hash('admin123.', 12);
+    console.log('[Reset] Password hashed. Attempting upsert to Supabase...');
+    
+    const { data, error } = await supabase.from('gyms').upsert({
+      email: 'coregym@gmail.com',
+      auth_password_hash: hash,
+      phone: '0000000000',
+      gym_name: 'Core Gym Super Admin',
+      owner_name: 'System Admin',
+      is_active: true,
+      plan_type: 'pro'
+    }, { onConflict: 'email' }).select().single();
+    
+    if (error) {
+      console.error('[Reset] Supabase Error:', error);
+      throw error;
+    }
+    
+    console.log('[Reset] Success! Created/Updated:', data.email);
+    res.json({ success: true, message: 'Super Admin Reset Successful', email: data.email });
+  } catch (err) {
+    console.error('[Reset] Critical Failure:', err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
 
 // ── GET /api/auth/health-check ──────────────
 router.get('/health-check', (req, res) => {
@@ -27,7 +63,7 @@ router.post('/login', async (req, res) => {
   const { data: gym, error } = await supabase
     .from('gyms')
     .select('*, auth_password_hash')
-    .eq('email', email.toLowerCase())
+    .eq('email', email.trim().toLowerCase())
     .single();
 
   if (error || !gym) {
@@ -37,9 +73,9 @@ router.post('/login', async (req, res) => {
   const storedValue = gym.auth_password_hash || '';
   const [actualHash] = storedValue.split('::');
   const valid = await bcrypt.compare(password, actualHash);
-  
+
   if (!valid) return res.status(401).json({ success: false, message: 'Invalid email or password' });
-  
+
   // Proactive Suspension Check
   const now = new Date();
   const isExpired = gym.subscription_ends_at && new Date(gym.subscription_ends_at) < now;
@@ -48,12 +84,16 @@ router.post('/login', async (req, res) => {
     gym.is_active = false;
   }
 
-  const role = ADMIN_EMAILS.includes(email.toLowerCase()) ? 'admin' : 'gym_owner';
+  const emailClean = email.trim().toLowerCase();
+  const adminEmails = (process.env.SUPER_ADMIN_EMAIL || 'wahabwaqas@gmail.com').toLowerCase().split(',').map(e => e.trim());
   
+  // Requirement: Any gym with 'pro' status logs into the super dashboard instead of the simple dashboard.
+  const role = (gym.plan_type === 'pro' || adminEmails.includes(emailClean)) ? 'admin' : 'gym_owner';
+
   if (role === 'gym_owner' && !gym.is_active) {
-    return res.status(403).json({ 
-      success: false, 
-      message: 'Your gym access is suspended. Please contact the administrator for renewal.' 
+    return res.status(403).json({
+      success: false,
+      message: 'Your gym access is suspended. Please contact the administrator at 03069005213 for renewal.'
     });
   }
 
@@ -89,7 +129,7 @@ router.post('/register', async (req, res) => {
   const hash = await bcrypt.hash(body.password, 12);
   // Store only bcrypt hash; do NOT persist plaintext password
   const storedHash = hash;
-  
+
   const { data: gym, error } = await supabase.from('gyms').insert({
     gym_name: body.gym_name,
     owner_name: body.owner_name,
@@ -119,7 +159,7 @@ router.post('/change-password', async (req, res) => {
 
   const storedValue = gym.auth_password_hash || '';
   const [actualHash] = storedValue.split('::');
-  
+
   const valid = await bcrypt.compare(current_password, actualHash);
   if (!valid) return res.status(401).json({ success: false, message: 'Current password is incorrect' });
 

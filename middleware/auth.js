@@ -14,6 +14,24 @@ const authenticate = async (req, res, next) => {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     req.user = decoded;
+
+    // Check suspension for gym_owners
+    if (decoded.role === 'gym_owner') {
+      const { data: gym } = await supabase
+        .from('gyms')
+        .select('is_active')
+        .eq('id', decoded.gym_id)
+        .single();
+        
+      if (gym && gym.is_active === false) {
+        return res.status(403).json({ 
+          success: false, 
+          message: 'Your gym access is suspended. Please contact admin at 03069005213.', 
+          isSuspended: true 
+        });
+      }
+    }
+
     next();
   } catch (err) {
     return res.status(401).json({ success: false, message: 'Invalid or expired token' });
