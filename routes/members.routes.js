@@ -51,6 +51,20 @@ router.get('/:id', async (req, res) => {
 // ── POST /api/members ─── Add member
 router.post('/', async (req, res) => {
   const body = memberSchema.parse(req.body);
+
+  // Check for duplicate member (same name and phone in this gym)
+  const { data: existing } = await supabase
+    .from('members')
+    .select('id')
+    .eq('gym_id', req.user.gym_id)
+    .eq('phone', body.phone.trim())
+    .ilike('name', body.name.trim())
+    .maybeSingle();
+
+  if (existing) {
+    return res.status(409).json({ success: false, message: 'Member with this name and phone already exists' });
+  }
+
   const { data, error } = await supabase.from('members').insert({ ...body, gym_id: req.user.gym_id, status: 'inactive' }).select().single();
   if (error) throw error;
   res.status(201).json({ success: true, data, message: 'Member added successfully' });
@@ -68,14 +82,8 @@ router.put('/:id', async (req, res) => {
 router.delete('/:id', async (req, res) => {
   const memberId = req.params.id;
   const gymId = req.user.gym_id;
-
-  // 1. Delete associated data first (Manual Cascade)
-  await supabase.from('payments').delete().eq('member_id', memberId).eq('gym_id', gymId);
-  await supabase.from('attendance').delete().eq('member_id', memberId).eq('gym_id', gymId);
-  await supabase.from('notifications').delete().eq('member_id', memberId).eq('gym_id', gymId);
-
-  // 2. Delete member last
-  const { error } = await supabase.from('members').delete().eq('id', memberId).eq('gym_id', gymId);
+  // Soft delete member instead of unlinking/deleting, to preserve payment history names
+  const { error } = await supabase.from('members').update({ status: 'deleted' }).eq('id', memberId).eq('gym_id', gymId);
   
   if (error) {
     console.error('CRITICAL Delete error for Member:', memberId, error);

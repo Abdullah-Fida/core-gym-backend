@@ -61,10 +61,8 @@ router.put('/:id', async (req, res) => {
 });
 
 router.delete('/:id', async (req, res) => {
-  // Delete associated salary payments first
-  await supabase.from('staff_payments').delete().eq('staff_id', req.params.id).eq('gym_id', req.user.gym_id);
-  
-  const { error } = await supabase.from('staff').delete().eq('id', req.params.id).eq('gym_id', req.user.gym_id);
+  // Soft delete staff instead of unlinking/deleting, to preserve salary history names
+  const { error } = await supabase.from('staff').update({ status: 'deleted' }).eq('id', req.params.id).eq('gym_id', req.user.gym_id);
   if (error) throw error;
   res.json({ success: true, message: 'Staff removed' });
 });
