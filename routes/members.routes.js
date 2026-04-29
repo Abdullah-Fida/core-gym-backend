@@ -82,8 +82,18 @@ router.put('/:id', async (req, res) => {
 router.delete('/:id', async (req, res) => {
   const memberId = req.params.id;
   const gymId = req.user.gym_id;
-  // Soft delete member instead of unlinking/deleting, to preserve payment history names
-  const { error } = await supabase.from('members').update({ status: 'deleted' }).eq('id', memberId).eq('gym_id', gymId);
+  const { permanent } = req.query;
+
+  let error;
+  if (permanent === 'true') {
+    // Hard delete member and all associated records (via DB cascade)
+    const result = await supabase.from('members').delete().eq('id', memberId).eq('gym_id', gymId);
+    error = result.error;
+  } else {
+    // Soft delete member instead of unlinking/deleting, to preserve payment history names
+    const result = await supabase.from('members').update({ status: 'deleted' }).eq('id', memberId).eq('gym_id', gymId);
+    error = result.error;
+  }
   
   if (error) {
     console.error('CRITICAL Delete error for Member:', memberId, error);
@@ -93,7 +103,7 @@ router.delete('/:id', async (req, res) => {
     });
   }
 
-  res.json({ success: true, message: 'Member and all associated records deleted' });
+  res.json({ success: true, message: permanent === 'true' ? 'Member and all associated records permanently deleted' : 'Member removed (records preserved)' });
 });
 
 // ── GET /api/members/:id/attendance ─── Member attendance

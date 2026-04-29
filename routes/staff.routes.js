@@ -61,10 +61,23 @@ router.put('/:id', async (req, res) => {
 });
 
 router.delete('/:id', async (req, res) => {
-  // Soft delete staff instead of unlinking/deleting, to preserve salary history names
-  const { error } = await supabase.from('staff').update({ status: 'deleted' }).eq('id', req.params.id).eq('gym_id', req.user.gym_id);
+  const { permanent } = req.query;
+  const staffId = req.params.id;
+  const gymId = req.user.gym_id;
+
+  let error;
+  if (permanent === 'true') {
+    // Hard delete staff and all associated records (via DB cascade)
+    const result = await supabase.from('staff').delete().eq('id', staffId).eq('gym_id', gymId);
+    error = result.error;
+  } else {
+    // Soft delete staff instead of unlinking/deleting, to preserve salary history names
+    const result = await supabase.from('staff').update({ status: 'deleted' }).eq('id', staffId).eq('gym_id', gymId);
+    error = result.error;
+  }
+
   if (error) throw error;
-  res.json({ success: true, message: 'Staff removed' });
+  res.json({ success: true, message: permanent === 'true' ? 'Staff and all associated records permanently deleted' : 'Staff removed (records preserved)' });
 });
 
 // ── Staff Salary Payments ─────────────────
