@@ -21,16 +21,57 @@ const expenseSchema = z.object({
 // ── GET /api/expenses ─────────────────────
 router.get('/', async (req, res) => {
   const { month, year, category } = req.query;
-  let query = supabase.from('expenses').select('*').eq('gym_id', req.user.gym_id);
-  if (month && year) {
-    const start = `${year}-${String(month).padStart(2, '0')}-01`;
-    const end = new Date(year, month, 0).toISOString().split('T')[0];
-    query = query.gte('expense_date', start).lte('expense_date', end);
+  const gymId = req.user.gym_id;
+
+  try {
+    // 1. Fetch regular expenses
+    let expQuery = supabase.from('expenses').select('*').eq('gym_id', gymId);
+    if (month && year) {
+      const start = `${year}-${String(month).padStart(2, '0')}-01`;
+      const end = new Date(Date.UTC(year, month, 0)).toISOString().split('T')[0];
+      expQuery = expQuery.gte('expense_date', start).lte('expense_date', end);
+    }
+    if (category && category !== 'staff_salary') {
+      expQuery = expQuery.eq('category', category);
+    }
+    const { data: expData, error: expError } = await expQuery.order('expense_date', { ascending: false });
+    if (expError) throw expError;
+
+    // 2. Fetch staff salaries (staff_payments) if not filtering by a specific regular category
+    let salaryData = [];
+    if (!category || category === 'staff_salary') {
+      let salQuery = supabase.from('staff_payments').select('*, staff:staff_id(name)').eq('gym_id', gymId);
+      if (month && year) {
+        salQuery = salQuery.eq('month', Number(month)).eq('year', Number(year));
+      }
+      const { data: sData, error: sError } = await salQuery.order('paid_date', { ascending: false });
+      if (sError) throw sError;
+      
+      // Map staff payments to match expense object structure expected by frontend
+      salaryData = (sData || []).map(sp => ({
+        id: sp.id,
+        gym_id: sp.gym_id,
+        category: 'staff_salary',
+        amount: sp.amount_paid,
+        expense_date: sp.paid_date,
+        description: `Salary: ${sp.staff?.name || 'Staff'}`,
+        is_staff_salary: true,
+        created_at: sp.created_at
+      }));
+    }
+
+    // 3. Combine and sort
+    const combined = [...(expData || []), ...salaryData].sort((a, b) => new Date(b.expense_date) - new Date(a.expense_date));
+
+    // If category is staff_salary, only return salaries
+    if (category === 'staff_salary') {
+      return res.json({ success: true, data: salaryData });
+    }
+
+    res.json({ success: true, data: combined });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
-  if (category) query = query.eq('category', category);
-  const { data, error } = await query.order('expense_date', { ascending: false });
-  if (error) throw error;
-  res.json({ success: true, data });
 });
 
 // ── GET /api/expenses/summary/:year ──────

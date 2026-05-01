@@ -39,10 +39,28 @@ router.get('/', async (req, res) => {
 
 // ── GET /api/payments/pending ─── Expired / due members
 router.get('/pending', async (req, res) => {
-  const today = new Date().toISOString().split('T')[0];
-  const { data, error } = await supabase.from('members').select('*, payments(id, amount, payment_date, expiry_date)').eq('gym_id', req.user.gym_id).in('status', ['expired', 'due_soon']).order('name');
+  const { data, error } = await supabase.from('members').select('*, payments(id, amount, payment_date, expiry_date)').eq('gym_id', req.user.gym_id).not('status', 'eq', 'deleted').order('name');
   if (error) throw error;
-  res.json({ success: true, data });
+  
+  const today = new Date();
+  today.setHours(0,0,0,0);
+  
+  const pending = data.filter(m => {
+    let actualExpiry = m.latest_expiry;
+    if (!actualExpiry && m.payments && m.payments.length > 0) {
+      const sorted = [...m.payments].sort((a,b) => new Date(b.expiry_date || b.payment_date) - new Date(a.expiry_date || a.payment_date));
+      actualExpiry = sorted[0].expiry_date || sorted[0].payment_date;
+    }
+    if (!actualExpiry) return false;
+    
+    const target = new Date(actualExpiry);
+    target.setHours(0,0,0,0);
+    const days = Math.ceil((target - today) / (1000 * 60 * 60 * 24));
+    
+    return days <= 3; // due_soon (0 to 3 days) or expired (< 0)
+  });
+  
+  res.json({ success: true, data: pending });
 });
 
 // ── GET /api/payments/all-transactions ─── 
