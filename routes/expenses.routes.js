@@ -37,9 +37,9 @@ router.get('/', async (req, res) => {
     const { data: expData, error: expError } = await expQuery.order('expense_date', { ascending: false });
     if (expError) throw expError;
 
-    // 2. Fetch staff salaries (staff_payments) if not filtering by a specific regular category
+    // 2. Fetch staff salaries (staff_payments) ONLY if explicitly requested via category
     let salaryData = [];
-    if (!category || category === 'staff_salary') {
+    if (category === 'staff_salary') {
       let salQuery = supabase.from('staff_payments').select('*, staff:staff_id(name)').eq('gym_id', gymId);
       if (month && year) {
         salQuery = salQuery.eq('month', Number(month)).eq('year', Number(year));
