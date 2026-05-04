@@ -34,7 +34,7 @@ const PORT = process.env.PORT || 4000;
 // ── Security & Parsing ──────────────
 app.use(helmet());
 app.use(cors({
-  origin: process.env.NODE_ENV === 'production' 
+  origin: process.env.NODE_ENV === 'production'
     ? [process.env.FRONTEND_URL].filter(Boolean)
     : true,  // Allow ALL origins in development (any device on local network)
   credentials: true,
