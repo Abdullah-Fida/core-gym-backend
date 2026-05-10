@@ -22,15 +22,7 @@ router.get('/gyms', async (req, res) => {
   const { data, error, count } = await query.range(Number(offset), Number(offset) + Number(limit) - 1);
   if (error) throw error;
 
-  // Proactive Suspension check for the returned list
-  const now = new Date();
-  for (const g of data || []) {
-    const isExpired = g.subscription_ends_at && new Date(g.subscription_ends_at) < now;
-    if (isExpired && g.is_active) {
-      await supabase.from('gyms').update({ is_active: false }).eq('id', g.id);
-      g.is_active = false;
-    }
-  }
+
 
   res.json({ success: true, data, count });
 });
@@ -119,13 +111,7 @@ router.get('/gyms/:id', async (req, res) => {
   `).eq('id', gymId).single();
   if (error || !gym) return res.status(404).json({ success: false, message: 'Gym not found' });
 
-  // Proactive Suspension
-  const now = new Date();
-  const isExpired = gym.subscription_ends_at && new Date(gym.subscription_ends_at) < now;
-  if (isExpired && gym.is_active) {
-    await supabase.from('gyms').update({ is_active: false }).eq('id', gym.id);
-    gym.is_active = false;
-  }
+
 
   // Get sums manually
   const { data: payments } = await supabase.from('admin_notes').select('text').eq('gym_id', gymId).eq('admin', 'PaymentSystem');
@@ -166,12 +152,6 @@ router.patch('/gyms/:id', async (req, res) => {
   res.json({ success: true, data, message: 'Gym updated' });
 });
 
-// ── DELETE /api/admin/gyms/:id ────────────
-router.delete('/gyms/:id', async (req, res) => {
-  const { error } = await supabase.from('gyms').delete().eq('id', req.params.id);
-  if (error) throw error;
-  res.json({ success: true, message: 'Gym deleted entirely' });
-});
 
 // ── PATCH /api/admin/gyms/:id/plan ────────
 router.patch('/gyms/:id/plan', async (req, res) => {
@@ -239,12 +219,8 @@ router.get('/alerts', async (req, res) => {
 
   const alerts = [];
   for (const g of gyms || []) {
-    // 1. Suspension Evaluation (Lazy Cron)
+    // 1. Suspension Evaluation
     const isExpired = (g.subscription_ends_at && new Date(g.subscription_ends_at) < now);
-    if (isExpired && g.is_active) {
-      await supabase.from('gyms').update({ is_active: false }).eq('id', g.id);
-      g.is_active = false; // update local state
-    }
 
     if (!g.is_active) {
       // It is suspended, add it as a high-priority alert
@@ -252,9 +228,18 @@ router.get('/alerts', async (req, res) => {
         id: `suspended_${g.id}`, 
         type: 'suspended_expired', 
         gym: g, 
-        message: `Subscription expired on ${new Date(g.subscription_ends_at).toDateString()}` 
+        message: `Gym is suspended manually` 
       });
       continue; // skip other alerts if suspended
+    }
+    
+    if (isExpired && g.is_active) {
+      alerts.push({ 
+        id: `expired_active_${g.id}`, 
+        type: 'suspended_expired', 
+        gym: g, 
+        message: `Subscription expired on ${new Date(g.subscription_ends_at).toDateString()} (Needs Suspension)` 
+      });
     }
 
     // 2. Trial/Subscription Ending Soon

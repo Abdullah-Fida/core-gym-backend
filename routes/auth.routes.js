@@ -76,13 +76,7 @@ router.post('/login', async (req, res) => {
 
   if (!valid) return res.status(401).json({ success: false, message: 'Invalid email or password' });
 
-  // Proactive Suspension Check
-  const now = new Date();
-  const isExpired = gym.subscription_ends_at && new Date(gym.subscription_ends_at) < now;
-  if (isExpired && gym.is_active) {
-    await supabase.from('gyms').update({ is_active: false }).eq('id', gym.id);
-    gym.is_active = false;
-  }
+
 
   const emailClean = email.trim().toLowerCase();
   const adminEmails = (process.env.SUPER_ADMIN_EMAIL || 'wahabwaqas@gmail.com').toLowerCase().split(',').map(e => e.trim());
