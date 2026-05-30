@@ -322,6 +322,24 @@ router.delete('/unmark', async (req, res) => {
   res.json({ success: true, message: 'Attendance unmarked' });
 });
 
+// ── GET /api/attendance ─────────────
+router.get('/', async (req, res) => {
+  const date = req.query.date || getTodayDate();
+  const { data, error } = await supabase
+    .from('attendance')
+    .select('id, member_id, check_in_time, date, members(id, name, phone, status, latest_expiry, notes)')
+    .eq('gym_id', req.user.gym_id)
+    .eq('date', date)
+    .order('check_in_time', { ascending: false });
+
+  if (error) throw error;
+  const normalized = (data || []).map((row) => ({
+    ...row,
+    members: withFingerprint(row.members),
+  }));
+  res.json({ success: true, data: normalized, date, count: normalized.length });
+});
+
 // ── GET /api/attendance/today ─────────────
 router.get('/today', async (req, res) => {
   const today = getTodayDate();
