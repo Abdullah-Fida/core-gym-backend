@@ -20,35 +20,11 @@ router.get('/verify', authenticate, (req, res) => {
   res.json({ success: true, user: req.user });
 });
 
-// TEMPORARY: Reset Super Admin (Delete after use)
-router.get('/reset-super-admin', async (req, res) => {
-  console.log('[Reset] Starting Super Admin reset for coregym@gmail.com...');
-  try {
-    const hash = await bcrypt.hash('admin123.', 12);
-    console.log('[Reset] Password hashed. Attempting upsert to Supabase...');
-    
-    const { data, error } = await supabase.from('gyms').upsert({
-      email: 'coregym@gmail.com',
-      auth_password_hash: hash,
-      phone: '0000000000',
-      gym_name: 'Core Gym Super Admin',
-      owner_name: 'System Admin',
-      is_active: true,
-      plan_type: 'pro'
-    }, { onConflict: 'email' }).select().single();
-    
-    if (error) {
-      console.error('[Reset] Supabase Error:', error);
-      throw error;
-    }
-    
-    console.log('[Reset] Success! Created/Updated:', data.email);
-    res.json({ success: true, message: 'Super Admin Reset Successful', email: data.email });
-  } catch (err) {
-    console.error('[Reset] Critical Failure:', err.message);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
+// NOTE: an unauthenticated GET /reset-super-admin used to live here. It
+// upserted coregym@gmail.com with the hardcoded password 'admin123.' and
+// plan_type 'pro', so any visitor to that URL received full super admin
+// access. Removed. Create admins with scripts/seed-admin.js instead, which
+// runs server-side with the service role key and generates a random password.
 
 // ── GET /api/auth/health-check ──────────────
 router.get('/health-check', (req, res) => {
