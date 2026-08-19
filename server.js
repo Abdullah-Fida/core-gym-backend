@@ -72,37 +72,6 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString(), version: '1.0.0', env: process.env.NODE_ENV });
 });
 
-// ── TEMPORARY DIAGNOSTIC — delete once the Supabase connection is confirmed ──
-// Reports which Supabase project the running function actually sees. Exposes
-// only hostnames, booleans and the JWT's public `ref` claim — never a key.
-app.get('/env-check', (req, res) => {
-  const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-  // A Supabase key's middle segment is unsigned public JSON: {ref, role, exp}
-  let keyRef = null, keyRole = null;
-  try {
-    const claims = JSON.parse(Buffer.from(key.split('.')[1], 'base64').toString());
-    keyRef = claims.ref;
-    keyRole = claims.role;
-  } catch { /* key absent or malformed */ }
-
-  res.json({
-    supabase_url_present: Boolean(url),
-    supabase_url_host: url ? new URL(url).host : '(missing — client falls back to http://localhost)',
-    supabase_url_has_whitespace: url ? url !== url.trim() : null,
-    service_key_present: Boolean(key),
-    service_key_project_ref: keyRef,
-    service_key_role: keyRole,
-    url_and_key_agree: Boolean(url && keyRef && url.includes(keyRef)),
-    // If a stale .env shipped in the bundle, dotenv loaded it at boot
-    bundled_env_file: require('fs').existsSync(require('path').join(__dirname, '.env')),
-    node_env: process.env.NODE_ENV || null,
-    deployed_commit: (process.env.VERCEL_GIT_COMMIT_SHA || '').slice(0, 7) || null,
-    deployed_branch: process.env.VERCEL_GIT_COMMIT_REF || null,
-  });
-});
-
 // ── API Routes ────────────────────────
 app.use('/api/auth', authRoutes);
 app.use('/api/gym', gymRoutes);
