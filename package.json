@@ -1,7 +1,7 @@
 {
-  "name": "core-gym-backend",
+  "name": "batgos-backend",
   "version": "1.0.0",
-  "description": "Core Gym SaaS — REST API Backend (Node.js + Express + Supabase)",
+  "description": "Batgos — REST API Backend (Node.js + Express + Supabase)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

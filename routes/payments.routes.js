@@ -1,10 +1,10 @@
 const express = require('express');
 const { z } = require('zod');
 const { supabase } = require('../db/supabase');
-const { authenticate, requireGymOwner } = require('../middleware/auth');
+const { authenticate, requireGymOwner, ownGymOnly } = require('../middleware/auth');
 
 const router = express.Router();
-router.use(authenticate, requireGymOwner);
+router.use(authenticate, requireGymOwner, ownGymOnly);
 
 const paymentSchema = z.object({
   id: z.string().optional(), // allow client-generated offline id
@@ -156,7 +156,7 @@ router.get('/all-transactions', async (req, res) => {
         method: 'LOG',
         reason: payload.details || 'N/A'
       });
-    } catch(e) {}
+    } catch { /* malformed audit JSON — skip this row */ }
   });
 
   transactions.sort((a, b) => new Date(b.date) - new Date(a.date));

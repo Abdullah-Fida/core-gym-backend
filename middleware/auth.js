@@ -1,6 +1,8 @@
 const jwt = require('jsonwebtoken');
 const { supabase } = require('../db/supabase');
 
+const SUPPORT_CONTACT = process.env.SUPPORT_CONTACT || 'support';
+
 /**
  * Verify JWT and attach user to request
  */
@@ -24,10 +26,10 @@ const authenticate = async (req, res, next) => {
         .single();
         
       if (gym && gym.is_active === false) {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'Your gym access is suspended. Please contact admin at 03069005213.', 
-          isSuspended: true 
+        return res.status(403).json({
+          success: false,
+          message: `Your gym access is suspended. Please contact admin at ${SUPPORT_CONTACT}.`,
+          isSuspended: true,
         });
       }
     }

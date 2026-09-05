@@ -1,10 +1,10 @@
 const express = require('express');
 const { z } = require('zod');
 const { supabase } = require('../db/supabase');
-const { authenticate, requireGymOwner } = require('../middleware/auth');
+const { authenticate, requireGymOwner, ownGymOnly } = require('../middleware/auth');
 
 const router = express.Router();
-router.use(authenticate, requireGymOwner);
+router.use(authenticate, requireGymOwner, ownGymOnly);
 
 const staffSchema = z.object({
   id: z.string().optional(),
@@ -95,7 +95,11 @@ router.post('/:id/salary', async (req, res) => {
     payment_method, 
     notes 
   };
-  if (id) payload.id = id;
+  // paid_date was accepted from the client and then silently dropped, so the
+  // column always fell back to CURRENT_DATE — back-dating a salary payment
+  // did nothing.
+  if (paid_date) payload.paid_date = String(paid_date).split('T')[0];
+  if (id) payload.id = id; // client-generated id, for offline resync
 
   const { data, error } = await supabase.from('staff_payments').insert(payload).select().single();
   if (error) throw error;
@@ -119,7 +123,7 @@ router.get('/:id/salary', async (req, res) => {
 });
 
 router.delete('/:staffId/salary/:salaryId', async (req, res) => {
-  const { staffId, salaryId } = req.params;
+  const { salaryId } = req.params;
 
   const { data: salary } = await supabase.from('staff_payments').select('*, staff(name)').eq('id', salaryId).single();
   if (salary) {

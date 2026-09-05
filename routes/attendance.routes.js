@@ -1,9 +1,9 @@
 const express = require('express');
 const { supabase } = require('../db/supabase');
-const { authenticate, requireGymOwner } = require('../middleware/auth');
+const { authenticate, requireGymOwner, ownGymOnly } = require('../middleware/auth');
 
 const router = express.Router();
-router.use(authenticate, requireGymOwner);
+router.use(authenticate, requireGymOwner, ownGymOnly);
 
 const getTodayDate = () => new Date().toISOString().split('T')[0];
 
@@ -273,10 +273,12 @@ router.post('/fingerprint/scan', async (req, res) => {
 });
 
 // ── POST /api/attendance/mark ─────────────
-router.post('/mark', async (req, res) => {
+const markAttendance = async (req, res) => {
   const member_id = String(req.body.member_id || '').trim();
-  const date = normalizeDate(req.body.date) || getTodayDate();
-  const check_in_time = req.body.check_in_time ? new Date(req.body.check_in_time).toISOString() : new Date().toISOString();
+  const date = normalizeDate(req.body.date || req.body.timestamp) || getTodayDate();
+  // `timestamp` is the shape the scanner and the offline queue send; keep both.
+  const rawTime = req.body.check_in_time || req.body.timestamp;
+  const check_in_time = rawTime ? new Date(rawTime).toISOString() : new Date().toISOString();
 
   if (!member_id) return res.status(400).json({ success: false, message: 'member_id is required' });
 
@@ -310,9 +312,28 @@ router.post('/mark', async (req, res) => {
     .select('id, member_id, check_in_time, date')
     .single();
 
-  if (error) throw error;
-  res.status(201).json({ success: true, message: 'Attendance marked manually', data, member: normalizedMember });
-});
+  if (error) {
+    // Unique (member_id, date) — a concurrent scan won the race. Idempotent.
+    if (error.code === '23505') {
+      const { data: existingRow } = await supabase
+        .from('attendance')
+        .select('id, member_id, check_in_time, date')
+        .eq('member_id', member_id)
+        .eq('date', date)
+        .eq('gym_id', req.user.gym_id)
+        .maybeSingle();
+      return res.json({ success: true, message: 'Already marked', already: true, data: existingRow, member: normalizedMember });
+    }
+    throw error;
+  }
+  res.status(201).json({ success: true, message: 'Attendance marked', data, member: normalizedMember });
+};
+
+// POST /api/attendance and POST /api/attendance/mark are the same operation.
+// The bare path is what AttendancePage and AttendanceScanner have always
+// called; it simply did not exist, so every check-in 404'd silently.
+router.post('/mark', markAttendance);
+router.post('/', markAttendance);
 
 // ── DELETE /api/attendance/unmark ─────────
 router.delete('/unmark', async (req, res) => {
