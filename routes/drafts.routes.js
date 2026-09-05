@@ -1,9 +1,9 @@
 const express = require('express');
 const { supabase } = require('../db/supabase');
-const { authenticate } = require('../middleware/auth');
+const { authenticate, requireGymOwner, ownGymOnly } = require('../middleware/auth');
 const router = express.Router();
 
-router.use(authenticate);
+router.use(authenticate, requireGymOwner, ownGymOnly);
 
 /**
  * @route   GET /api/drafts/:pageId

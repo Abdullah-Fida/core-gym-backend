@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { z } = require('zod');
@@ -7,9 +8,23 @@ const { authenticate } = require('../middleware/auth');
 
 const router = express.Router();
 
-// Simple in-memory OTP store for password resets (expires in 10 minutes).
-// Note: ephemeral and not suitable for multi-instance production.
-const otps = new Map();
+// Password-reset OTPs live in the `password_resets` table (migration 001).
+// They used to live in a process-local `new Map()`, which meant every cold
+// start wiped them and no two instances agreed — password reset could never
+// work on a serverless/multi-instance deploy.
+const OTP_TTL_MS = 10 * 60 * 1000;
+const OTP_MAX_ATTEMPTS = 5;
+
+const SUPPORT_CONTACT = process.env.SUPPORT_CONTACT || 'support';
+const SUSPENDED_MESSAGE = `Your gym access is suspended. Please contact the administrator at ${SUPPORT_CONTACT} for renewal.`;
+
+/** Emails always treated as super admin, regardless of the stored role. */
+const superAdminEmails = () =>
+  (process.env.SUPER_ADMIN_EMAIL || '')
+    .toLowerCase()
+    .split(',')
+    .map((e) => e.trim())
+    .filter(Boolean);
 
 const signToken = (payload) =>
   jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '7d' });
@@ -55,16 +70,23 @@ router.post('/login', async (req, res) => {
 
 
   const emailClean = email.trim().toLowerCase();
-  const adminEmails = (process.env.SUPER_ADMIN_EMAIL || 'wahabwaqas@gmail.com').toLowerCase().split(',').map(e => e.trim());
-  
-  // Requirement: Any gym with 'pro' status logs into the super dashboard instead of the simple dashboard.
-  const role = (gym.plan_type === 'pro' || adminEmails.includes(emailClean)) ? 'admin' : 'gym_owner';
+
+  // Role comes from the gyms.role column — NOT from plan_type. It previously
+  // read `gym.plan_type === 'pro' ? 'admin' : 'gym_owner'`, which handed every
+  // paying 'pro' customer full super-admin access to every other tenant on the
+  // platform. Billing tier and platform role are unrelated concerns.
+  const isEnvSuperAdmin = superAdminEmails().includes(emailClean);
+  const role = gym.role === 'admin' || isEnvSuperAdmin ? 'admin' : 'gym_owner';
+
+  // Self-heal: an address listed in SUPER_ADMIN_EMAIL gets its row promoted, so
+  // the column becomes the single source of truth after the first sign-in.
+  if (isEnvSuperAdmin && gym.role !== 'admin') {
+    await supabase.from('gyms').update({ role: 'admin' }).eq('id', gym.id);
+    gym.role = 'admin';
+  }
 
   if (role === 'gym_owner' && !gym.is_active) {
-    return res.status(403).json({
-      success: false,
-      message: 'Your gym access is suspended. Please contact the administrator at 03069005213 for renewal.'
-    });
+    return res.status(403).json({ success: false, message: SUSPENDED_MESSAGE });
   }
 
   const token = signToken({ gym_id: gym.id, email: gym.email, role });
@@ -72,7 +94,7 @@ router.post('/login', async (req, res) => {
   // Update last_login_at
   await supabase.from('gyms').update({ last_login_at: new Date().toISOString() }).eq('id', gym.id);
 
-  const { auth_password_hash, ...safeGym } = gym;
+  const { auth_password_hash: _pw, ...safeGym } = gym;
   res.json({ success: true, token, role, gym: safeGym });
 });
 
@@ -110,6 +132,7 @@ router.post('/register', async (req, res) => {
     default_monthly_fee: body.default_monthly_fee,
     auth_password_hash: storedHash,
     plan_type: 'free',
+    role: 'gym_owner', // self-serve signup never provisions a platform admin
     is_active: true,
     trial_ends_at: new Date(Date.now() + 14 * 86400000).toISOString(),
   }).select().single();
@@ -117,14 +140,23 @@ router.post('/register', async (req, res) => {
   if (error) throw error;
 
   const token = signToken({ gym_id: gym.id, email: gym.email, role: 'gym_owner' });
-  const { auth_password_hash, ...safeGym } = gym;
+  const { auth_password_hash: _pw, ...safeGym } = gym;
   res.status(201).json({ success: true, token, role: 'gym_owner', gym: safeGym });
 });
 
 // ── POST /api/auth/change-password ────────
-router.post('/change-password', async (req, res) => {
-  const { gym_id, current_password, new_password } = req.body;
-  const { data: gym } = await supabase.from('gyms').select('auth_password_hash').eq('id', gym_id).single();
+// `authenticate` is required: this route used to take gym_id straight from the
+// request body with no guard, so anyone who learned a gym's id and current
+// password could rotate it from an unauthenticated request.
+router.post('/change-password', authenticate, async (req, res) => {
+  const schema = z.object({
+    current_password: z.string().min(1),
+    new_password: z.string().min(4).max(100),
+  });
+  const { current_password, new_password } = schema.parse(req.body);
+  const gymId = req.user.gym_id; // from the JWT, never the body
+
+  const { data: gym } = await supabase.from('gyms').select('auth_password_hash').eq('id', gymId).single();
   if (!gym) return res.status(404).json({ success: false, message: 'Gym not found' });
 
   const storedValue = gym.auth_password_hash || '';
@@ -134,8 +166,7 @@ router.post('/change-password', async (req, res) => {
   if (!valid) return res.status(401).json({ success: false, message: 'Current password is incorrect' });
 
   const hash = await bcrypt.hash(new_password, 12);
-  const storedHash = hash;
-  await supabase.from('gyms').update({ auth_password_hash: storedHash }).eq('id', gym_id);
+  await supabase.from('gyms').update({ auth_password_hash: hash }).eq('id', gymId);
   res.json({ success: true, message: 'Password changed successfully' });
 });
 
@@ -145,36 +176,85 @@ router.post('/forgot-password', async (req, res) => {
   if (!phone) return res.status(400).json({ success: false, message: 'Phone number is required' });
 
   const { data: gym } = await supabase.from('gyms').select('id').eq('phone', phone).maybeSingle();
-  if (!gym) return res.status(404).json({ success: false, message: 'Phone number not registered' });
 
-  // Generate a 6-digit OTP and store it in-memory for a short time.
-  const otp = String(Math.floor(100000 + Math.random() * 900000));
-  otps.set(phone, { otp, expiresAt: Date.now() + 10 * 60 * 1000 });
-  // Log OTP to server logs for development/testing. Do NOT return OTP in API response.
+  // Always answer the same way. Returning 404 for an unknown number turned this
+  // endpoint into a free "is this gym registered?" oracle.
+  const genericResponse = {
+    success: true,
+    message: 'If that number is registered, an OTP has been sent to it.',
+  };
+  if (!gym) return res.json(genericResponse);
+
+  // Invalidate any outstanding codes for this number, then issue one.
+  await supabase
+    .from('password_resets')
+    .update({ consumed_at: new Date().toISOString() })
+    .eq('phone', phone)
+    .is('consumed_at', null);
+
+  const otp = String(crypto.randomInt(100000, 1000000));
+  const otpHash = await bcrypt.hash(otp, 10);
+
+  const { error } = await supabase.from('password_resets').insert({
+    gym_id: gym.id,
+    phone,
+    otp_hash: otpHash,
+    expires_at: new Date(Date.now() + OTP_TTL_MS).toISOString(),
+  });
+  if (error) throw error;
+
+  // TODO(phase-6): hand this to the messaging layer instead of the console.
   if (process.env.NODE_ENV !== 'production') console.log(`[Auth] OTP for ${phone}: ${otp}`);
 
-  res.json({ success: true, message: 'OTP sent to your phone' });
+  res.json(genericResponse);
 });
 
 // ── POST /api/auth/reset-password ─────────
 router.post('/reset-password', async (req, res) => {
-  const { phone, otp, new_password } = req.body;
-  if (!phone || !otp || !new_password) return res.status(400).json({ success: false, message: 'Missing fields' });
+  const schema = z.object({
+    phone: z.string().min(1),
+    otp: z.union([z.string(), z.number()]),
+    new_password: z.string().min(4).max(100),
+  });
+  const { phone, otp, new_password } = schema.parse(req.body);
 
-  // Validate OTP from in-memory store
-  const rec = otps.get(phone);
-  if (!rec || rec.otp !== String(otp) || rec.expiresAt < Date.now()) {
-    return res.status(400).json({ success: false, message: 'Invalid or expired OTP code' });
+  const { data: reset } = await supabase
+    .from('password_resets')
+    .select('*')
+    .eq('phone', phone)
+    .is('consumed_at', null)
+    .gt('expires_at', new Date().toISOString())
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  const invalid = { success: false, message: 'Invalid or expired OTP code' };
+  if (!reset) return res.status(400).json(invalid);
+
+  if (reset.attempts >= OTP_MAX_ATTEMPTS) {
+    await supabase
+      .from('password_resets')
+      .update({ consumed_at: new Date().toISOString() })
+      .eq('id', reset.id);
+    return res.status(429).json({ success: false, message: 'Too many attempts. Request a new code.' });
   }
-  // Consume OTP
-  otps.delete(phone);
 
-  const { data: gym } = await supabase.from('gyms').select('id').eq('phone', phone).single();
-  if (!gym) return res.status(404).json({ success: false, message: 'Gym not found' });
+  const matches = await bcrypt.compare(String(otp), reset.otp_hash);
+  if (!matches) {
+    await supabase
+      .from('password_resets')
+      .update({ attempts: reset.attempts + 1 })
+      .eq('id', reset.id);
+    return res.status(400).json(invalid);
+  }
 
   const hash = await bcrypt.hash(new_password, 12);
-  const storedHash = hash;
-  await supabase.from('gyms').update({ auth_password_hash: storedHash }).eq('id', gym.id);
+  await supabase.from('gyms').update({ auth_password_hash: hash }).eq('id', reset.gym_id);
+  await supabase
+    .from('password_resets')
+    .update({ consumed_at: new Date().toISOString() })
+    .eq('id', reset.id);
+
   res.json({ success: true, message: 'Password reset successful' });
 });
 

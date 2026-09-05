@@ -4,7 +4,38 @@ const { authenticate, requireAdmin } = require('../middleware/auth');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { z } = require('zod');
+const { resolveEndDate, deriveBillingStatus, periodStart } = require('../lib/subscription');
+const { dialCodeForTimezone } = require('../lib/dialCodes');
 const router = express.Router();
+
+/**
+ * Append to the subscription audit trail. Never allowed to fail the request
+ * that triggered it — a lost audit row must not roll back a completed renewal.
+ */
+async function logSubscriptionEvent(gymId, event, { from, to, actor, note } = {}) {
+  try {
+    await supabase.from('subscription_events').insert({
+      gym_id: gymId,
+      event,
+      from_state: from || null,
+      to_state: to || null,
+      actor: actor || 'super_admin',
+      note: note || null,
+    });
+  } catch (err) {
+    console.error('[subscription_events] failed to record', event, err.message);
+  }
+}
+
+/** The subset of gym fields worth snapshotting into an audit event. */
+const billingSnapshot = (g) => g && ({
+  plan_type: g.plan_type,
+  plan_id: g.plan_id,
+  billing_status: g.billing_status,
+  is_active: g.is_active,
+  trial_ends_at: g.trial_ends_at,
+  subscription_ends_at: g.subscription_ends_at,
+});
 router.use(authenticate, requireAdmin);
 
 // ── GET /api/admin/gyms ───────────────────
@@ -28,63 +59,130 @@ router.get('/gyms', async (req, res) => {
 });
 
 // ── POST /api/admin/gyms ──────────────────
+// Creates a gym with an explicit plan, an explicit trial-or-paid period, and
+// its own locale. Previously this hardcoded plan_type:'basic', ignored the
+// subscription_duration the client could send, and wrote the same timestamp to
+// both trial_ends_at and subscription_ends_at.
 router.post('/gyms', async (req, res) => {
   const schema = z.object({
     gym_name: z.string().min(2).max(100),
     owner_name: z.string().min(2).max(100),
-    phone: z.string().optional().or(z.literal('')),
+    // gyms.phone is NOT NULL, so this cannot be optional — a blank one
+    // failed at the database with an opaque 500 instead of a field error.
+    phone: z.string().min(6, 'A contact phone number is required.').max(30),
     email: z.string().email(),
-    password: z.string().min(4).max(100),
-    city: z.string().optional().or(z.literal('')),
-    address: z.string().optional().or(z.literal('')),
-    default_monthly_fee: z.union([z.string(), z.number()]).optional().default(3000),
-    subscription_duration: z.string().optional(),
-    custom_days: z.union([z.string(), z.number()]).optional(),
+    password: z.string().min(8).max(100),
+    city: z.string().max(80).optional().or(z.literal('')),
+    address: z.string().max(300).optional().or(z.literal('')),
+    default_monthly_fee: z.coerce.number().min(0).default(3000),
+
+    plan_code: z.string().default('basic'),
+
+    // Billing mode. A trial and a paid period are different things: a trial has
+    // an end date but no expectation of payment.
+    billing_mode: z.enum(['trial', 'paid']).default('paid'),
+    trial_days: z.coerce.number().int().min(1).max(365).optional(),
+    subscription_months: z.coerce.number().int().min(1).max(60).optional(),
+    subscription_days: z.coerce.number().int().min(1).max(3650).optional(),
+    starts_at: z.string().datetime().optional(),
+
+    // Locale — set once at creation so the gym owner sees their own currency
+    // and their day boundaries land in their own timezone.
+    currency: z.string().length(3).default('PKR'),
+    timezone: z.string().min(3).max(64).default('Asia/Karachi'),
+    locale: z.string().min(2).max(10).default('en-PK'),
+    payment_methods: z.array(z.string()).min(1).default(['cash', 'card', 'bank_transfer']),
+    // Optional: derived from the timezone when not supplied. Without this the
+    // column default ('92') applied to every gym, so a US gym's member numbers
+    // were rewritten to +92 and WhatsApp messages went to the wrong country.
+    country_code: z.string().regex(/^\d{1,4}$/).optional(),
+
+    setup_fee: z.coerce.number().min(0).optional(),
   });
 
-  try {
-    const body = schema.parse({ ...req.body, default_monthly_fee: Number(req.body.default_monthly_fee) || 3000 });
-    
-    // Check duplicate
-    const { data: existing } = await supabase.from('gyms').select('id').eq('email', body.email.toLowerCase()).maybeSingle();
-    if (existing) return res.status(409).json({ success: false, message: 'Email already registered' });
+  const body = schema.parse(req.body);
+  const email = body.email.toLowerCase().trim();
 
-    let subscription_ends_at = new Date();
-    if (body.subscription_duration === 'custom') {
-      subscription_ends_at.setDate(subscription_ends_at.getDate() + (Number(body.custom_days) || 14));
-    } else {
-      const months = Number(body.subscription_duration) || 1;
-      subscription_ends_at.setMonth(subscription_ends_at.getMonth() + months);
-    }
+  const { data: existing } = await supabase.from('gyms').select('id').eq('email', email).maybeSingle();
+  if (existing) return res.status(409).json({ success: false, message: 'That email is already registered.' });
 
-    const hash = await bcrypt.hash(body.password, 12);
-    // Store only the bcrypt hash; never persist plaintext password
-    const storedHash = hash;
-    
-    const { data: gym, error } = await supabase.from('gyms').insert({
-      gym_name: body.gym_name,
-      owner_name: body.owner_name,
-      phone: body.phone,
-      email: body.email.toLowerCase(),
-      city: body.city,
-      address: body.address,
-      default_monthly_fee: body.default_monthly_fee,
-      auth_password_hash: storedHash,
-      plan_type: 'basic',
-      is_active: true,
-      subscription_ends_at: subscription_ends_at.toISOString(),
-      trial_ends_at: subscription_ends_at.toISOString(), // Keep it in sync for MVP logic if used elsewhere
-    }).select().single();
-
-    if (error) throw error;
-    res.status(201).json({ success: true, data: gym, message: 'Gym registered successfully!' });
-  } catch (err) {
-    if (err instanceof z.ZodError) {
-      const errorMsg = err.errors.map(e => `${e.path.join('.')}: ${e.message}`).join(', ');
-      return res.status(400).json({ success: false, message: `Validation error: ${errorMsg}` });
-    }
-    throw err;
+  const { data: plan } = await supabase.from('plans').select('*').eq('code', body.plan_code).maybeSingle();
+  if (!plan) {
+    return res.status(400).json({ success: false, message: `Unknown plan "${body.plan_code}".` });
   }
+
+  const startsAt = body.starts_at ? new Date(body.starts_at) : new Date();
+  if (Number.isNaN(startsAt.getTime())) {
+    return res.status(400).json({ success: false, message: 'Invalid start date.' });
+  }
+
+  let trialEndsAt = null;
+  let subscriptionEndsAt = null;
+
+  if (body.billing_mode === 'trial') {
+    trialEndsAt = resolveEndDate({ startFrom: startsAt, days: body.trial_days ?? 14 }, startsAt);
+    // Access is granted for the trial window; there is no paid period yet.
+    subscriptionEndsAt = trialEndsAt;
+  } else {
+    subscriptionEndsAt = resolveEndDate(
+      { startFrom: startsAt, months: body.subscription_months, days: body.subscription_days },
+      startsAt
+    );
+    if (!subscriptionEndsAt) {
+      return res.status(400).json({
+        success: false,
+        message: 'Choose a subscription length — months or days.',
+      });
+    }
+  }
+
+  const hash = await bcrypt.hash(body.password, 12);
+
+  const { data: gym, error } = await supabase.from('gyms').insert({
+    gym_name: body.gym_name.trim(),
+    owner_name: body.owner_name.trim(),
+    phone: body.phone,
+    email,
+    city: body.city || null,
+    address: body.address || null,
+    default_monthly_fee: body.default_monthly_fee,
+    auth_password_hash: hash,
+    role: 'gym_owner',
+    plan_id: plan.id,
+    plan_type: plan.code,
+    is_active: true,
+    billing_status: body.billing_mode === 'trial' ? 'trialing' : 'active',
+    subscription_started_at: startsAt.toISOString(),
+    subscription_ends_at: subscriptionEndsAt.toISOString(),
+    trial_ends_at: trialEndsAt ? trialEndsAt.toISOString() : null,
+    currency: body.currency.toUpperCase(),
+    timezone: body.timezone,
+    locale: body.locale,
+    country_code: body.country_code || dialCodeForTimezone(body.timezone) || '92',
+    payment_methods: body.payment_methods,
+  }).select().single();
+
+  if (error) throw error;
+
+  await logSubscriptionEvent(gym.id, body.billing_mode === 'trial' ? 'trial_started' : 'created', {
+    to: billingSnapshot(gym),
+    actor: req.user?.email,
+    note: `Created on ${plan.name}`,
+  });
+
+  if (body.setup_fee > 0) {
+    await supabase.from('platform_payments').insert({
+      gym_id: gym.id,
+      amount: body.setup_fee,
+      currency: gym.currency,
+      kind: 'setup',
+      note: 'One-time setup fee',
+      created_by: req.user?.email || 'super_admin',
+    });
+  }
+
+  const { auth_password_hash: _pw, ...safeGym } = gym;
+  res.status(201).json({ success: true, data: safeGym, message: `${gym.gym_name} registered.` });
 });
 
 // ── POST /api/admin/gyms/:id/login ───────
@@ -99,7 +197,7 @@ router.post('/gyms/:id/login', async (req, res) => {
     { expiresIn: '1h' }
   );
 
-  const { auth_password_hash, ...safeGym } = gym;
+  const { auth_password_hash: _pw, ...safeGym } = gym;
   res.json({ success: true, token, role: 'gym_owner', gym: safeGym, message: 'Login generated' });
 });
 
@@ -107,26 +205,43 @@ router.post('/gyms/:id/login', async (req, res) => {
 router.get('/gyms/:id', async (req, res) => {
   const gymId = req.params.id;
   const { data: gym, error } = await supabase.from('gyms').select(`
-    *, members(count), staff(count)
+    *, plan:plans(id, code, name, price, currency, billing_period, member_limit),
+    members(count), staff(count)
   `).eq('id', gymId).single();
   if (error || !gym) return res.status(404).json({ success: false, message: 'Gym not found' });
 
+  const now = new Date();
+  const firstOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
 
+  const [platformRes, memberRevRes, expenseRes] = await Promise.all([
+    // What this gym has paid US.
+    supabase.from('platform_payments').select('amount, kind, paid_at').eq('gym_id', gymId),
+    // What this gym collected from its own members this month.
+    supabase.from('payments').select('amount').eq('gym_id', gymId).gte('payment_date', firstOfMonth.slice(0, 10)),
+    supabase.from('expenses').select('amount').eq('gym_id', gymId).gte('expense_date', firstOfMonth.slice(0, 10)),
+  ]);
 
-  // Get sums manually
-  const { data: payments } = await supabase.from('admin_notes').select('text').eq('gym_id', gymId).eq('admin', 'PaymentSystem');
-  const { data: expenses } = await supabase.from('expenses').select('amount').eq('gym_id', gymId);
-  const revenue = (payments || []).reduce((acc, p) => {
-    try { 
-      const val = JSON.parse(p.text).amount || 0;
-      return acc + Number(val); 
-    } catch(e) { return acc; }
-  }, 0);
-  const totalExpenses = (expenses || []).reduce((acc, e) => acc + Number(e.amount || 0), 0);
+  const platformPayments = platformRes.data || [];
+  const sum = (rows) => rows.reduce((acc, r) => acc + (Number(r.amount) || 0), 0);
 
-  const { auth_password_hash, ...safeGym } = gym;
+  // These were previously one figure named `revenue_this_month` that actually
+  // summed every platform payment ever made, with no date filter at all.
+  const platformRevenueTotal = sum(platformPayments);
+  const platformRevenueThisMonth = sum(platformPayments.filter((p) => p.paid_at >= firstOfMonth));
 
-  res.json({ success: true, data: { ...safeGym, revenue_this_month: revenue, expense_this_month: totalExpenses } });
+  const { auth_password_hash: _pw, ...safeGym } = gym;
+
+  res.json({
+    success: true,
+    data: {
+      ...safeGym,
+      platform_revenue_total: platformRevenueTotal,
+      platform_revenue_this_month: platformRevenueThisMonth,
+      revenue_this_month: sum(memberRevRes.data || []),
+      expense_this_month: sum(expenseRes.data || []),
+      payments_this_month: (memberRevRes.data || []).length,
+    },
+  });
 });
 
 // ── PATCH /api/admin/gyms/:id ─────────────
@@ -153,6 +268,46 @@ router.patch('/gyms/:id', async (req, res) => {
 });
 
 
+// ── DELETE /api/admin/gyms/:id ────────────
+/**
+ * Permanently remove a gym and everything belonging to it.
+ *
+ * There was no way to do this at all — a gym created by mistake could only be
+ * suspended, and its rows stayed in the platform's metrics forever.
+ *
+ * Every child table is declared ON DELETE CASCADE, so one delete removes the
+ * members, payments, staff, classes, leads, products, sales, measurements and
+ * messaging rows with it. That is not reversible, so the caller must confirm by
+ * sending the gym's exact name.
+ */
+router.delete('/gyms/:id', async (req, res) => {
+  const { data: gym } = await supabase
+    .from('gyms').select('id, gym_name, role').eq('id', req.params.id).maybeSingle();
+  if (!gym) return res.status(404).json({ success: false, message: 'Gym not found.' });
+
+  // A super admin deleting their own account would lock everyone out.
+  if (gym.role === 'admin') {
+    return res.status(400).json({ success: false, message: 'Platform admin accounts cannot be deleted here.' });
+  }
+  if (gym.id === req.user.gym_id) {
+    return res.status(400).json({ success: false, message: 'You cannot delete the account you are signed in as.' });
+  }
+
+  // Typing the name is the guard against deleting the wrong row from a list.
+  const confirmation = req.body?.confirm_name ?? req.query?.confirm_name;
+  if (confirmation !== undefined && confirmation !== gym.gym_name) {
+    return res.status(400).json({
+      success: false,
+      message: `Confirmation did not match. Type "${gym.gym_name}" exactly to delete it.`,
+    });
+  }
+
+  const { error } = await supabase.from('gyms').delete().eq('id', gym.id);
+  if (error) throw error;
+
+  res.json({ success: true, message: `${gym.gym_name} and all of its data were deleted.` });
+});
+
 // ── PATCH /api/admin/gyms/:id/plan ────────
 router.patch('/gyms/:id/plan', async (req, res) => {
   const { plan_type, subscription_ends_at, is_active } = req.body;
@@ -163,50 +318,79 @@ router.patch('/gyms/:id/plan', async (req, res) => {
 
 // ── GET /api/admin/metrics ────────────────
 router.get('/metrics', async (req, res) => {
-  const { data: gyms, error } = await supabase.from('gyms').select('id, plan_type, is_active, created_at, trial_ends_at, subscription_ends_at');
-  if (error) throw error;
-  
-  // Calculate total super admin revenue (Split)
-  const { data: payments } = await supabase.from('admin_notes').select('text').eq('admin', 'PaymentSystem');
+  const [gymsRes, plansRes, paymentsRes] = await Promise.all([
+    supabase.from('gyms').select('id, plan_id, plan_type, is_active, created_at, trial_ends_at, subscription_ends_at, billing_status'),
+    supabase.from('plans').select('id, code, price'),
+    supabase.from('platform_payments').select('amount, kind, paid_at'),
+  ]);
+
+  if (gymsRes.error) throw gymsRes.error;
+
+  const gyms = gymsRes.data || [];
+  const plans = plansRes.data || [];
+  const payments = paymentsRes.data || [];
+
+  // Prices come from the plans table. They were previously hardcoded here as
+  // { free: 0, basic: 2000, pro: 5000 } and duplicated in the frontend, so the
+  // dashboard could report an MRR that no longer matched what customers paid.
+  const priceById = new Map(plans.map((p) => [p.id, Number(p.price) || 0]));
+  const priceByCode = new Map(plans.map((p) => [p.code, Number(p.price) || 0]));
+  const planPrice = (g) => priceById.get(g.plan_id) ?? priceByCode.get(g.plan_type) ?? 0;
+
   let totalMonthlyRevenue = 0;
   let totalSetupRevenue = 0;
-  
-  for (const p of payments || []) {
-    try { 
-      const payload = JSON.parse(p.text);
-      const val = Number(payload.amount || 0);
-      if (payload.type === 'SETUP') {
-        totalSetupRevenue += val;
-      } else {
-        totalMonthlyRevenue += val;
-      }
-    } catch(e) {}
+  for (const p of payments) {
+    const amount = Number(p.amount) || 0;
+    if (p.kind === 'setup') totalSetupRevenue += amount;
+    else if (p.kind === 'refund') totalMonthlyRevenue -= Math.abs(amount);
+    else totalMonthlyRevenue += amount;
   }
 
-  const totalCombinedRevenue = totalMonthlyRevenue + totalSetupRevenue;
-
   const now = new Date();
+  const isTrialing = (g) => g.trial_ends_at && new Date(g.trial_ends_at) > now;
+
   const totalGyms = gyms.length;
-  const activePayingGyms = gyms.filter(g => g.is_active && g.plan_type !== 'free').length;
-  const trialGyms = gyms.filter(g => g.trial_ends_at && new Date(g.trial_ends_at) > now).length;
-  const churnedGyms = gyms.filter(g => !g.is_active).length;
+  const activePayingGyms = gyms.filter((g) => g.is_active && !isTrialing(g) && planPrice(g) > 0).length;
+  const trialGyms = gyms.filter((g) => g.is_active && isTrialing(g)).length;
+  const churnedGyms = gyms.filter((g) => !g.is_active).length;
 
-  const planPrices = { free: 0, basic: 2000, pro: 5000 };
-  const mrr = gyms.filter(g => g.is_active).reduce((s, g) => s + (planPrices[g.plan_type] || 0), 0);
+  // MRR counts only gyms actually being billed — a gym on a free trial is not
+  // recurring revenue, and the old calculation counted it as such.
+  const mrr = gyms
+    .filter((g) => g.is_active && !isTrialing(g))
+    .reduce((sum, g) => sum + planPrice(g), 0);
 
-  // New gyms this month
   const firstOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
-  const newThisMonth = gyms.filter(g => g.created_at >= firstOfMonth).length;
+  const newThisMonth = gyms.filter((g) => g.created_at >= firstOfMonth).length;
 
-  // Renewals due next 7 days
+  const revenueThisMonth = payments
+    .filter((p) => p.paid_at >= firstOfMonth)
+    .reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+
   const in7 = new Date(now);
   in7.setDate(in7.getDate() + 7);
-  const renewalsDue = gyms.filter(g => g.subscription_ends_at && new Date(g.subscription_ends_at) <= in7 && new Date(g.subscription_ends_at) >= now).length;
+  const renewalsDue = gyms.filter(
+    (g) => g.subscription_ends_at
+      && new Date(g.subscription_ends_at) <= in7
+      && new Date(g.subscription_ends_at) >= now
+  ).length;
 
-  res.json({ success: true, data: { 
-    totalGyms, activePayingGyms, trialGyms, churnedGyms, mrr, newThisMonth, renewalsDue, 
-    totalMonthlyRevenue, totalSetupRevenue, totalCombinedRevenue 
-  } });
+  res.json({
+    success: true,
+    data: {
+      totalGyms,
+      activePayingGyms,
+      trialGyms,
+      churnedGyms,
+      mrr,
+      newThisMonth,
+      renewalsDue,
+      revenueThisMonth,
+      totalMonthlyRevenue,
+      totalSetupRevenue,
+      totalCombinedRevenue: totalMonthlyRevenue + totalSetupRevenue,
+    },
+  });
 });
 
 // ── GET /api/admin/alerts ─────────────────
@@ -272,107 +456,302 @@ router.get('/gyms/:id/notes', async (req, res) => {
   res.json({ success: true, data });
 });
 
-// ── PAYMENTS ROUTING ──────────────────────
-router.post('/gyms/:id/payments', async (req, res) => {
-  const { amount, type = 'RECURRING', date = new Date().toISOString() } = req.body;
-  if (!amount || isNaN(Number(amount))) return res.status(400).json({ success: false, message: 'Valid amount required' });
-  const text = JSON.stringify({ amount: Number(amount), date, type });
-  const { data, error } = await supabase.from('admin_notes').insert({ 
-    gym_id: req.params.id, text, admin: 'PaymentSystem', date
-  }).select().single();
-  if (error) throw error;
-  res.status(201).json({ success: true, data });
+/// ── PLATFORM PAYMENTS ─────────────────────
+// These read and write the real `platform_payments` table. Money previously
+// lived as a JSON string inside admin_notes.text, keyed by the magic value
+// admin='PaymentSystem', so amounts could not be summed in SQL and a single
+// malformed row zeroed the entire revenue figure.
+
+const paymentSchema = z.object({
+  amount: z.coerce.number().refine((n) => n !== 0, 'Amount cannot be zero.'),
+  kind: z.enum(['subscription', 'setup', 'refund', 'adjustment']).default('subscription'),
+  note: z.string().max(300).optional().or(z.literal('')),
+  paid_at: z.string().optional(),
 });
 
-router.patch('/gyms/:id/payments/:noteId', async (req, res) => {
-  const { amount, type, date } = req.body;
-  const { data: oldNote } = await supabase.from('admin_notes').select('text').eq('id', req.params.noteId).single();
-  if (!oldNote) return res.status(404).json({ success: false, message: 'Payment not found' });
+router.post('/gyms/:id/payments', async (req, res) => {
+  const body = paymentSchema.parse(req.body);
 
-  const payload = JSON.parse(oldNote.text);
-  if (amount !== undefined) payload.amount = Number(amount);
-  if (type !== undefined) payload.type = type;
-  if (date !== undefined) payload.date = date;
+  const { data: gym } = await supabase.from('gyms').select('currency').eq('id', req.params.id).maybeSingle();
+  if (!gym) return res.status(404).json({ success: false, message: 'Gym not found.' });
 
-  const { data, error } = await supabase.from('admin_notes').update({ 
-    text: JSON.stringify(payload),
-    date: date || new Date().toISOString()
-  }).eq('id', req.params.noteId).select().single();
-  
+  const { data, error } = await supabase.from('platform_payments').insert({
+    gym_id: req.params.id,
+    amount: body.amount,
+    currency: gym.currency || 'PKR',
+    kind: body.kind,
+    note: body.note || null,
+    paid_at: body.paid_at ? new Date(body.paid_at).toISOString() : new Date().toISOString(),
+    created_by: req.user?.email || 'super_admin',
+  }).select().single();
+
   if (error) throw error;
-  res.json({ success: true, data, message: 'Payment updated' });
+  res.status(201).json({ success: true, data, message: 'Payment recorded.' });
+});
+
+router.get('/gyms/:id/payments', async (req, res) => {
+  const { data, error } = await supabase
+    .from('platform_payments')
+    .select('*')
+    .eq('gym_id', req.params.id)
+    .order('paid_at', { ascending: false });
+  if (error) throw error;
+  res.json({ success: true, data });
+});
+
+router.patch('/gyms/:id/payments/:paymentId', async (req, res) => {
+  const body = paymentSchema.partial().parse(req.body);
+  const patch = {};
+  if (body.amount !== undefined) patch.amount = body.amount;
+  if (body.kind !== undefined) patch.kind = body.kind;
+  if (body.note !== undefined) patch.note = body.note || null;
+  if (body.paid_at !== undefined) patch.paid_at = new Date(body.paid_at).toISOString();
+
+  const { data, error } = await supabase
+    .from('platform_payments')
+    .update(patch)
+    .eq('id', req.params.paymentId)
+    .eq('gym_id', req.params.id)
+    .select()
+    .single();
+
+  if (error) throw error;
+  if (!data) return res.status(404).json({ success: false, message: 'Payment not found.' });
+  res.json({ success: true, data, message: 'Payment updated.' });
+});
+
+router.delete('/gyms/:id/payments/:paymentId', async (req, res) => {
+  const { error } = await supabase
+    .from('platform_payments')
+    .delete()
+    .eq('id', req.params.paymentId)
+    .eq('gym_id', req.params.id);
+  if (error) throw error;
+  res.json({ success: true, message: 'Payment voided.' });
 });
 
 router.get('/payments', async (req, res) => {
   const { data, error } = await supabase
-    .from('admin_notes')
-    .select('*, gym:gyms(gym_name)')
-    .eq('admin', 'PaymentSystem')
-    .order('date', { ascending: false });
+    .from('platform_payments')
+    .select('*, gym:gyms(gym_name, currency)')
+    .order('paid_at', { ascending: false })
+    .limit(500);
   if (error) throw error;
   res.json({ success: true, data });
 });
 
-router.get('/gyms/:id/payments', async (req, res) => {
-  const { data, error } = await supabase.from('admin_notes').select('*').eq('gym_id', req.params.id).eq('admin', 'PaymentSystem').order('date', { ascending: false });
-  if (error) throw error;
-  res.json({ success: true, data });
-});
 
-router.delete('/gyms/:id/payments/:noteId', async (req, res) => {
-  const { error } = await supabase.from('admin_notes').delete().eq('id', req.params.noteId).eq('admin', 'PaymentSystem');
-  if (error) throw error;
-  res.json({ success: true, message: 'Payment deleted' });
-});
+// ── SUBSCRIPTION LIFECYCLE ────────────────
 
-router.post('/gyms/:id/renew', async (req, res) => {
-  const { id } = req.params;
-  const { amount, months, customDays } = req.body;
-  if (!amount || isNaN(Number(amount))) return res.status(400).json({ success: false, message: 'Valid amount required' });
+/**
+ * Apply a new end date, flip the status, record the money, log the event.
+ *
+ * The period arithmetic lives in lib/subscription.js because it was previously
+ * written out four times across this file and the frontend, and the copies
+ * disagreed: two extended from today, two from the current end date.
+ */
+async function applyPeriodChange({ gymId, event, months, days, amount, note, actor, activate }) {
+  const { data: current } = await supabase.from('gyms').select('*').eq('id', gymId).maybeSingle();
+  if (!current) return { error: { status: 404, message: 'Gym not found.' } };
 
-  // Fetch current gym state to determine start basis
-  const { data: currentGym, error: fetchErr } = await supabase.from('gyms').select('subscription_ends_at').eq('id', id).single();
-  if (fetchErr || !currentGym) return res.status(404).json({ success: false, message: 'Gym not found' });
-
-  const now = new Date();
-  const currentEnd = currentGym.subscription_ends_at ? new Date(currentGym.subscription_ends_at) : now;
-  // If still active, add to existing end date. If expired, add from today.
-  const startBasis = currentEnd > now ? currentEnd : now;
-  
-  let newEndDate = new Date(startBasis);
-  if (customDays) {
-    newEndDate.setDate(newEndDate.getDate() + Number(customDays));
-  } else {
-    newEndDate.setMonth(newEndDate.getMonth() + (Number(months) || 1));
+  const newEnd = resolveEndDate({ startFrom: current.subscription_ends_at, months, days }, new Date());
+  if (!newEnd) {
+    return { error: { status: 400, message: 'Choose how long to extend by — months or days.' } };
   }
 
-  const dateStr = newEndDate.toISOString();
+  const patch = {
+    subscription_ends_at: newEnd.toISOString(),
+    billing_status: 'active',
+  };
+  if (activate) patch.is_active = true;
+  // Paying for a period ends any trial that was still running.
+  if (current.trial_ends_at) patch.trial_ends_at = null;
 
-  // 1. Update Gym
-  const { data: updatedGym, error: gErr } = await supabase.from('gyms').update({
-    subscription_ends_at: dateStr,
-    trial_ends_at: dateStr, // Sync trial date too
-    is_active: true
-  }).eq('id', id).select().single();
+  const { data: updated, error } = await supabase
+    .from('gyms').update(patch).eq('id', gymId).select().single();
+  if (error) throw error;
 
-  if (gErr) throw gErr;
+  if (amount > 0) {
+    await supabase.from('platform_payments').insert({
+      gym_id: gymId,
+      amount,
+      currency: current.currency || 'PKR',
+      kind: 'subscription',
+      note: note || (days ? `Renewal: ${days} days` : `Renewal: ${months} months`),
+      created_by: actor || 'super_admin',
+    });
+  }
 
-  // 2. Log Payment in admin_notes
-  const paymentText = JSON.stringify({ 
-    amount: Number(amount), 
-    date: now.toISOString(), 
-    type: 'RECURRING',
-    note: `Renewal for ${months || customDays} ${customDays ? 'days' : 'months'}`
+  await logSubscriptionEvent(gymId, event, {
+    from: billingSnapshot(current),
+    to: billingSnapshot(updated),
+    actor,
+    note,
   });
-  
-  await supabase.from('admin_notes').insert({
-    gym_id: id,
-    text: paymentText,
-    admin: 'PaymentSystem',
-    date: now.toISOString()
+
+  return { data: updated };
+}
+
+router.post('/gyms/:id/renew', async (req, res) => {
+  const schema = z.object({
+    amount: z.coerce.number().min(0).default(0),
+    months: z.coerce.number().int().min(1).max(60).optional(),
+    customDays: z.coerce.number().int().min(1).max(3650).optional(),
+    note: z.string().max(300).optional(),
+  });
+  const body = schema.parse(req.body);
+
+  const result = await applyPeriodChange({
+    gymId: req.params.id,
+    event: 'extended',
+    months: body.months,
+    days: body.customDays,
+    amount: body.amount,
+    note: body.note,
+    actor: req.user?.email,
+    activate: true,
   });
 
-  res.json({ success: true, data: updatedGym, message: 'Gym access renewed successfully!' });
+  if (result.error) {
+    return res.status(result.error.status).json({ success: false, message: result.error.message });
+  }
+
+  const { auth_password_hash: _pw, ...safeGym } = result.data;
+  res.json({ success: true, data: safeGym, message: 'Subscription renewed.' });
+});
+
+// Convert a running trial into a paid subscription.
+router.post('/gyms/:id/convert-trial', async (req, res) => {
+  const schema = z.object({
+    plan_code: z.string(),
+    months: z.coerce.number().int().min(1).max(60).default(1),
+    amount: z.coerce.number().min(0).default(0),
+  });
+  const body = schema.parse(req.body);
+
+  const { data: current } = await supabase.from('gyms').select('*').eq('id', req.params.id).maybeSingle();
+  if (!current) return res.status(404).json({ success: false, message: 'Gym not found.' });
+
+  const { data: plan } = await supabase.from('plans').select('*').eq('code', body.plan_code).maybeSingle();
+  if (!plan) return res.status(400).json({ success: false, message: `Unknown plan "${body.plan_code}".` });
+
+  // The paid period starts when the trial ends, so the customer keeps the trial
+  // days they were promised instead of forfeiting them at conversion.
+  const basis = periodStart(current.trial_ends_at || current.subscription_ends_at);
+  const newEnd = resolveEndDate({ startFrom: basis, months: body.months }, new Date());
+
+  const { data: updated, error } = await supabase.from('gyms').update({
+    plan_id: plan.id,
+    plan_type: plan.code,
+    trial_ends_at: null,
+    subscription_ends_at: newEnd.toISOString(),
+    billing_status: 'active',
+    is_active: true,
+  }).eq('id', req.params.id).select().single();
+  if (error) throw error;
+
+  if (body.amount > 0) {
+    await supabase.from('platform_payments').insert({
+      gym_id: req.params.id,
+      amount: body.amount,
+      currency: current.currency || 'PKR',
+      kind: 'subscription',
+      note: `Trial converted to ${plan.name}`,
+      created_by: req.user?.email || 'super_admin',
+    });
+  }
+
+  await logSubscriptionEvent(req.params.id, 'trial_converted', {
+    from: billingSnapshot(current),
+    to: billingSnapshot(updated),
+    actor: req.user?.email,
+    note: `Converted to ${plan.name} for ${body.months} month(s)`,
+  });
+
+  const { auth_password_hash: _pw, ...safeGym } = updated;
+  res.json({ success: true, data: safeGym, message: `Converted to ${plan.name}.` });
+});
+
+router.post('/gyms/:id/suspend', async (req, res) => {
+  const { reason } = req.body || {};
+  const { data: current } = await supabase.from('gyms').select('*').eq('id', req.params.id).maybeSingle();
+  if (!current) return res.status(404).json({ success: false, message: 'Gym not found.' });
+
+  const { data: updated, error } = await supabase.from('gyms')
+    .update({ is_active: false, billing_status: 'suspended' })
+    .eq('id', req.params.id).select().single();
+  if (error) throw error;
+
+  await logSubscriptionEvent(req.params.id, 'suspended', {
+    from: billingSnapshot(current),
+    to: billingSnapshot(updated),
+    actor: req.user?.email,
+    note: reason || null,
+  });
+
+  const { auth_password_hash: _pw, ...safeGym } = updated;
+  res.json({ success: true, data: safeGym, message: 'Gym suspended.' });
+});
+
+router.post('/gyms/:id/reactivate', async (req, res) => {
+  const { data: current } = await supabase.from('gyms').select('*').eq('id', req.params.id).maybeSingle();
+  if (!current) return res.status(404).json({ success: false, message: 'Gym not found.' });
+
+  const { data: updated, error } = await supabase.from('gyms')
+    .update({
+      is_active: true,
+      // Recompute rather than assume 'active' — a gym whose period already
+      // lapsed should come back as past_due, not look like it paid.
+      billing_status: deriveBillingStatus({ ...current, is_active: true }),
+    })
+    .eq('id', req.params.id).select().single();
+  if (error) throw error;
+
+  await logSubscriptionEvent(req.params.id, 'reactivated', {
+    from: billingSnapshot(current),
+    to: billingSnapshot(updated),
+    actor: req.user?.email,
+  });
+
+  const { auth_password_hash: _pw, ...safeGym } = updated;
+  res.json({ success: true, data: safeGym, message: 'Gym reactivated.' });
+});
+
+// Change plan without touching the current period.
+router.post('/gyms/:id/change-plan', async (req, res) => {
+  const { plan_code } = req.body || {};
+  const { data: plan } = await supabase.from('plans').select('*').eq('code', plan_code).maybeSingle();
+  if (!plan) return res.status(400).json({ success: false, message: `Unknown plan "${plan_code}".` });
+
+  const { data: current } = await supabase.from('gyms').select('*').eq('id', req.params.id).maybeSingle();
+  if (!current) return res.status(404).json({ success: false, message: 'Gym not found.' });
+
+  const { data: updated, error } = await supabase.from('gyms')
+    .update({ plan_id: plan.id, plan_type: plan.code })
+    .eq('id', req.params.id).select().single();
+  if (error) throw error;
+
+  await logSubscriptionEvent(req.params.id, 'plan_changed', {
+    from: billingSnapshot(current),
+    to: billingSnapshot(updated),
+    actor: req.user?.email,
+    note: `${current.plan_type} to ${plan.code}`,
+  });
+
+  const { auth_password_hash: _pw, ...safeGym } = updated;
+  res.json({ success: true, data: safeGym, message: `Moved to ${plan.name}.` });
+});
+
+// ── GET /api/admin/gyms/:id/events ────────
+router.get('/gyms/:id/events', async (req, res) => {
+  const { data, error } = await supabase
+    .from('subscription_events')
+    .select('*')
+    .eq('gym_id', req.params.id)
+    .order('created_at', { ascending: false })
+    .limit(100);
+  if (error) throw error;
+  res.json({ success: true, data });
 });
 
 module.exports = router;

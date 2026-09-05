@@ -4,7 +4,9 @@ const { supabase } = require('../db/supabase');
 const { authenticate, requireGymOwner, ownGymOnly } = require('../middleware/auth');
 
 const router = express.Router();
-router.use(authenticate, requireGymOwner);
+// ownGymOnly rejects any request whose params/body/query name a different gym
+// than the caller's JWT. Admins pass through.
+router.use(authenticate, requireGymOwner, ownGymOnly);
 
 const memberSchema = z.object({
   id: z.string().optional(), // allow client-generated offline id
@@ -17,8 +19,11 @@ const memberSchema = z.object({
 
 // ── GET /api/members ─── List all members for a gym
 router.get('/', async (req, res) => {
-  const { gym_id, status, search, sort = 'name', limit = 100, offset = 0 } = req.query;
-  const gid = gym_id || req.user.gym_id;
+  const { status, search, sort = 'name', limit = 100, offset = 0 } = req.query;
+  // Always scope to the caller's own gym. This previously read
+  // `gym_id || req.user.gym_id`, so any authenticated user could dump another
+  // tenant's member list by passing ?gym_id=<their id>.
+  const gid = req.user.gym_id;
 
   let query = supabase.from('members').select('*, payments(id, amount, payment_date, expiry_date, plan_duration_months)').eq('gym_id', gid).order('payment_date', { foreignTable: 'payments', ascending: false });
 

@@ -1,9 +1,9 @@
 const express = require('express');
 const { supabase } = require('../db/supabase');
-const { authenticate, requireGymOwner } = require('../middleware/auth');
+const { authenticate, requireGymOwner, ownGymOnly } = require('../middleware/auth');
 
 const router = express.Router();
-router.use(authenticate, requireGymOwner);
+router.use(authenticate, requireGymOwner, ownGymOnly);
 
 router.get('/', async (req, res) => {
   const { status } = req.query;

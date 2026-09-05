@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS public.gyms (
     auth_password_hash   TEXT NOT NULL,
     city                 TEXT,
     address              TEXT,
-    plan_type            TEXT DEFAULT 'free',
+    plan_type            TEXT DEFAULT 'free',      -- billing tier: free | basic | pro
+    role                 TEXT NOT NULL DEFAULT 'gym_owner', -- platform role: gym_owner | admin
     trial_ends_at        TIMESTAMPTZ,
     subscription_ends_at TIMESTAMPTZ,
     is_active            BOOLEAN DEFAULT true,
@@ -63,6 +64,26 @@ ALTER TABLE public.gyms ADD COLUMN IF NOT EXISTS wa_msg_active       TEXT;
 ALTER TABLE public.gyms ADD COLUMN IF NOT EXISTS wa_msg_due_soon     TEXT;
 ALTER TABLE public.gyms ADD COLUMN IF NOT EXISTS wa_msg_expired      TEXT;
 ALTER TABLE public.gyms ADD COLUMN IF NOT EXISTS default_monthly_fee INTEGER DEFAULT 3000;
+-- Platform role. Never derive admin access from plan_type: doing so handed every
+-- paying 'pro' customer super-admin over all tenants. See migrations/001.
+ALTER TABLE public.gyms ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'gym_owner';
+
+
+-- ============================================================================
+-- 1b. PASSWORD_RESETS — OTP codes for owner password recovery
+--     The OTP is stored bcrypt-hashed so a leaked row cannot be replayed.
+--     Replaces a process-local in-memory Map (see migrations/001).
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS public.password_resets (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    gym_id      UUID REFERENCES public.gyms(id) ON DELETE CASCADE,
+    phone       TEXT NOT NULL,
+    otp_hash    TEXT NOT NULL,
+    expires_at  TIMESTAMPTZ NOT NULL,
+    consumed_at TIMESTAMPTZ,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
 
 
 -- ============================================================================
@@ -348,7 +369,9 @@ CREATE INDEX IF NOT EXISTS idx_payments_gym_date      ON public.payments (gym_id
 CREATE INDEX IF NOT EXISTS idx_payments_member        ON public.payments (member_id);
 
 CREATE INDEX IF NOT EXISTS idx_attendance_gym_date    ON public.attendance (gym_id, date DESC);
-CREATE INDEX IF NOT EXISTS idx_attendance_member_date ON public.attendance (member_id, date);
+-- One check-in per member per day. The API's read-then-insert races without
+-- this; see migrations/001 for the de-duplication step on existing data.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_member_date_unique ON public.attendance (member_id, date);
 
 CREATE INDEX IF NOT EXISTS idx_staff_gym              ON public.staff (gym_id);
 CREATE INDEX IF NOT EXISTS idx_staff_payments_gym     ON public.staff_payments (gym_id, year, month);
@@ -359,6 +382,9 @@ CREATE INDEX IF NOT EXISTS idx_notifications_gym      ON public.notifications (g
 CREATE INDEX IF NOT EXISTS idx_notifications_member   ON public.notifications (member_id);
 
 CREATE INDEX IF NOT EXISTS idx_access_logs_time       ON public.access_logs (timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_password_resets_phone  ON public.password_resets (phone, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_password_resets_expiry ON public.password_resets (expires_at);
+CREATE INDEX IF NOT EXISTS idx_gyms_role ON public.gyms (role) WHERE role = 'admin';
 CREATE INDEX IF NOT EXISTS idx_admin_notes_gym        ON public.admin_notes (gym_id, date DESC);
 
 
@@ -381,6 +407,7 @@ ALTER TABLE public.access_logs      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.admin_notes      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.form_drafts      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.whatsapp_auth    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.password_resets  ENABLE ROW LEVEL SECURITY;
 
 
 -- ============================================================================

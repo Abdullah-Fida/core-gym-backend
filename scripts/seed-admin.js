@@ -4,7 +4,11 @@ const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
 
-const SUPER_ADMIN_EMAIL = process.env.SUPER_ADMIN_EMAIL || 'wahabwaqas345@gmail.com';
+const SUPER_ADMIN_EMAIL = process.env.SUPER_ADMIN_EMAIL;
+if (!SUPER_ADMIN_EMAIL) {
+  console.error('❌ SUPER_ADMIN_EMAIL is not set in backend/.env');
+  process.exit(1);
+}
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || crypto.randomBytes(10).toString('hex');
 
 async function seedAdmin() {
@@ -30,7 +34,8 @@ async function seedAdmin() {
       // Update password hash if exists
       const { error } = await supabase.from('gyms').update({
         auth_password_hash: hash,
-        plan_type: 'pro',
+        // role, NOT plan_type. Admin access is no longer derived from billing.
+        role: 'admin',
         is_active: true
       }).eq('id', existing.id);
       
@@ -45,10 +50,11 @@ async function seedAdmin() {
         id: uuidv4(),
         email: email,
         auth_password_hash: hash,
-        gym_name: 'Core System Admin',
+        gym_name: 'Batgos Platform Admin',
         owner_name: 'Super Admin',
         phone: '0000000000',
-        plan_type: 'pro',
+        role: 'admin',
+        plan_type: 'free',
         is_active: true
       });
 
